@@ -3,8 +3,9 @@
 # of the License at http://www.apache.org/licenses/LICENSE-2.0
 # Copyright 2015 Marc Sibson
 
+from __future__ import absolute_import
 
-from datetime import datetime
+from datetime import datetime, MINYEAR
 import time
 
 try:
@@ -20,7 +21,7 @@ from celery.app import app_or_default
 
 from redis.client import StrictRedis
 
-from decoder import RedBeatJSONEncoder, RedBeatJSONDecoder
+from .decoder import RedBeatJSONEncoder, RedBeatJSONDecoder
 
 
 def add_defaults(app=None):
@@ -40,7 +41,8 @@ def redis(app=None):
     app = app_or_default(app)
 
     if not hasattr(app, 'redbeat_redis') or app.redbeat_redis is None:
-        app.redbeat_redis = StrictRedis.from_url(app.conf.REDBEAT_REDIS_URL)
+        app.redbeat_redis = StrictRedis.from_url(app.conf.REDBEAT_REDIS_URL,
+                                                 decode_responses=True)
 
     return app.redbeat_redis
 
@@ -55,6 +57,10 @@ logger = get_logger(__name__)
 
 def to_timestamp(dt):
     return time.mktime(dt.timetuple())
+
+
+def from_timestamp(ts):
+    return datetime.fromtimestamp(ts)
 
 
 class RedBeatSchedulerEntry(ScheduleEntry):
@@ -76,7 +82,7 @@ class RedBeatSchedulerEntry(ScheduleEntry):
 
         entry = RedBeatSchedulerEntry(app=app, **definition)
         meta = json.loads(data.get('meta', '{}'), cls=RedBeatJSONDecoder)
-        entry.last_run_at = meta.get('last_run_at', datetime.min)
+        entry.last_run_at = meta.get('last_run_at')
         entry.total_run_count = meta.get('total_run_count', 0)
 
         definition.update(meta)
@@ -85,10 +91,16 @@ class RedBeatSchedulerEntry(ScheduleEntry):
 
     @property
     def due_at(self):
-        if self.last_run_at == datetime.min:
+        # never run => due now
+        if self.last_run_at is None:
             return self._default_now()
 
         delta = self.schedule.remaining_estimate(self.last_run_at)
+
+        # overdue => due now
+        if delta.total_seconds() < 0:
+            return self._default_now()
+
         return self.last_run_at + delta
 
     @property
@@ -98,6 +110,10 @@ class RedBeatSchedulerEntry(ScheduleEntry):
     @property
     def score(self):
         return to_timestamp(self.due_at)
+
+    @property
+    def rank(self):
+        return redis(self.app).zrank(self.app.conf.REDBEAT_SCHEDULE_KEY, self.key)
 
     def save(self):
         definition = {
@@ -156,7 +172,8 @@ class RedBeatSchedulerEntry(ScheduleEntry):
         if not self.enabled:
             return False, 5.0  # 5 second delay for re-enable.
 
-        return super(RedBeatSchedulerEntry, self).is_due()
+        return self.schedule.is_due(self.last_run_at or
+                                    datetime(MINYEAR, 1, 1, tzinfo=self.schedule.tz))
 
 
 class RedBeatScheduler(Scheduler):
@@ -173,23 +190,27 @@ class RedBeatScheduler(Scheduler):
         super(RedBeatScheduler, self).__init__(app, **kwargs)
 
     def setup_schedule(self):
-        # cleanup old static entries
+        # cleanup old static schedule entries
         client = redis(self.app)
-        previous = client.smembers(self.app.conf.REDBEAT_STATICS_KEY)
-        current = set(self.app.conf.CELERYBEAT_SCHEDULE.keys())
-        removed = previous - current
+        previous = set(key for key in client.smembers(self.app.conf.REDBEAT_STATICS_KEY))
+        removed = previous.difference(self.app.conf.CELERYBEAT_SCHEDULE.keys())
+
         for name in removed:
-            RedBeatSchedulerEntry(name).delete()
+            logger.debug("Removing old static schedule entry '%s'.", name)
+            with client.pipeline() as pipe:
+                RedBeatSchedulerEntry(name, app=self.app).delete()
+                pipe.srem(self.app.conf.REDBEAT_STATICS_KEY, name)
+                pipe.execute()
 
-        # setup statics
+        # setup static schedule entries
         self.install_default_entries(self.app.conf.CELERYBEAT_SCHEDULE)
-        if not self.app.conf.CELERYBEAT_SCHEDULE:
-            return
+        if self.app.conf.CELERYBEAT_SCHEDULE:
+            self.update_from_dict(self.app.conf.CELERYBEAT_SCHEDULE)
 
-        self.update_from_dict(self.app.conf.CELERYBEAT_SCHEDULE)
-
-        # track static entries
-        client.sadd(self.app.conf.REDBEAT_STATICS_KEY, *self.app.conf.CELERYBEAT_SCHEDULE.keys())
+            # keep track of static schedule entries,
+            # so we notice when any are removed at next startup
+            client.sadd(self.app.conf.REDBEAT_STATICS_KEY,
+                        *self.app.conf.CELERYBEAT_SCHEDULE.keys())
 
     def update_from_dict(self, dict_):
         for name, entry in dict_.items():
@@ -200,7 +221,7 @@ class RedBeatScheduler(Scheduler):
                 continue
 
             entry.save()  # store into redis
-            logger.debug(unicode(entry))
+            logger.debug("Stored entry: %s", entry)
 
     def reserve(self, entry):
         new_entry = next(entry)

@@ -4,7 +4,8 @@ import json
 from basecase import RedBeatCase
 
 from redbeat import RedBeatSchedulerEntry
-from redbeat.decoder import RedBeatJSONDecoder, RedBeatJSONEncoder
+from redbeat.decoder import RedBeatJSONDecoder
+from redbeat.schedulers import to_timestamp, from_timestamp
 
 
 class test_RedBeatEntry(RedBeatCase):
@@ -22,9 +23,10 @@ class test_RedBeatEntry(RedBeatCase):
             'options': {},
             'enabled': True,
         }
+        expected_key = (self.app.conf.REDBEAT_KEY_PREFIX + 'test')
 
         redis = self.app.redbeat_redis
-        value = redis.hget(self.app.conf.REDBEAT_KEY_PREFIX + 'test', 'definition')
+        value = redis.hget(expected_key, 'definition')
         self.assertEqual(expected, json.loads(value, cls=RedBeatJSONDecoder))
         self.assertEqual(redis.zrank(self.app.conf.REDBEAT_SCHEDULE_KEY, e.key), 0)
         self.assertEqual(redis.zscore(self.app.conf.REDBEAT_SCHEDULE_KEY, e.key), e.score)
@@ -38,7 +40,7 @@ class test_RedBeatEntry(RedBeatCase):
 
         loaded = RedBeatSchedulerEntry.from_key(initial.key, self.app)
         self.assertEqual(initial.task, loaded.task)
-        self.assertEqual(loaded.last_run_at, datetime.min)
+        self.assertIsNone(loaded.last_run_at)
 
     def test_next(self):
         initial = self.create_entry().save()
@@ -100,3 +102,25 @@ class test_RedBeatEntry(RedBeatCase):
 
         self.assertLess(now, due_at)
         self.assertLess(due_at, now + entry.schedule.run_every)
+
+    def test_due_at_overdue(self):
+        last_run_at = self.app.now() - timedelta(hours=10)
+        entry = self.create_entry(last_run_at=last_run_at)
+
+        before = entry._default_now()
+        due_at = entry.due_at
+
+        self.assertLess(last_run_at, due_at)
+        self.assertGreater(due_at, before)
+
+    def test_score(self):
+        run_every = 61*60
+        entry = self.create_entry(run_every=run_every)
+        entry = entry._next_instance()
+
+        score = entry.score
+        expected = entry.last_run_at + timedelta(seconds=run_every)
+        expected = expected.replace(microsecond=0)  # discard microseconds, lost in timestamp
+
+        self.assertEqual(score, to_timestamp(expected))
+        self.assertEqual(expected, from_timestamp(score))
